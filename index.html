@@ -619,6 +619,8 @@ function freshProgressFor(subject){
     weakAreas: [], topicProgress, topicReadDates: {},
     attempts: buildRecent(subject, averageScore),
     flashState:{},
+    topicActiveSeconds: {},   // { topicName: real accumulated active seconds } — leaderboard topic-completion tracker, separate from the daily reading-progress/mastery bump above
+    topicCompletionAwarded: {}, // { topicName: true } once the 15-minute leaderboard reward has been paid — never paid twice for the same topic
   };
   if (subject.id === 'aetcom'){
     // Competency domains and OSCE stats start unassessed — they're
@@ -638,7 +640,7 @@ function freshState(){
   const progress = {};
   subjects.forEach(s => { progress[s.id] = freshProgressFor(s); });
   return {
-    dataVersion: 2, // bump this if a future change needs another one-time migration — see migrateToGenuineTracking()
+    dataVersion: 3, // bump this if a future change needs another one-time migration — see migrateToGenuineTracking()/migrateToUnifiedPoints()
     auth: { loggedIn:false, profile:null },
     subjects, progress,
     uploads: [],
@@ -649,6 +651,8 @@ function freshState(){
     lastMCQSessionIds: {},  // subject|topic -> question ids used last session, so "Practise again" avoids repeats
     lastFlashDeckIds: {},   // subject|topic (or upload:id) -> card ids used last deck
     theme: 'light',         // 'light' | 'dark' — "Night Shift" mode, see toggleTheme()
+    pointTransactions: [],  // the single source of truth for the unified leaderboard score — see awardPoints()
+    awardedKeys: {},        // reward-key -> transaction id, prevents the same activity from ever paying out twice
     notifications: [
       { id:'n1', text:'Welcome to CLINOVA — open Human Anatomy to start tracking real progress.', read:false },
       { id:'n2', text:'Your stats (streak, questions, mock tests, flashcards) start at zero and grow only from what you actually do here.', read:false },
@@ -689,6 +693,43 @@ function migrateToGenuineTracking(state){
   return state;
 }
 
+/* v2 -> v3: introduces the unified point-transaction ledger (topic
+   completion + quiz + test + feedback all rolled into one score) and
+   real per-topic active-time tracking. Backfills the new fields for
+   any account that predates them; never touches anything that already
+   earned real feedback points (those get migrated forward into the
+   new ledger as 'feedback' transactions so nobody's history is lost). */
+function migrateToUnifiedPoints(state){
+  if ((state.dataVersion || 0) >= 3) return state;
+  state.pointTransactions = state.pointTransactions || [];
+  state.awardedKeys = state.awardedKeys || {};
+  Object.keys(state.progress || {}).forEach(id => {
+    const p = state.progress[id];
+    if (!p) return;
+    p.topicActiveSeconds = p.topicActiveSeconds || {};
+    p.topicCompletionAwarded = p.topicCompletionAwarded || {};
+  });
+  // Carry forward any feedback points already earned under the old
+  // model into the new ledger, one transaction per feedback item, so
+  // existing feedback contributors don't lose credit.
+  (state.feedback || []).forEach(f => {
+    const key = 'feedback_' + f.id;
+    if (state.awardedKeys[key]) return;
+    const points = f.pointsAwarded || 0;
+    if (points <= 0) return;
+    const tx = {
+      id: 'tx_migrated_' + f.id, studentId: f.studentId, type: 'feedback', points,
+      subjectId: f.subject || null, topicId: f.topic || null, activityId: f.id,
+      studentYear: f.year || null, studentCollege: f.college || null,
+      timestamp: f.createdAt || new Date().toISOString(),
+    };
+    state.pointTransactions.push(tx);
+    state.awardedKeys[key] = tx.id;
+  });
+  state.dataVersion = 3;
+  return state;
+}
+
 /* Genuine study-streak tracking: recordActivity() is called by every
    real study action (see its call sites below); calculateStreak()
    counts consecutive calendar days of activity ending today (or
@@ -726,7 +767,10 @@ function loadState(){
     parsed.lastMCQSessionIds = parsed.lastMCQSessionIds || {};
     parsed.lastFlashDeckIds = parsed.lastFlashDeckIds || {};
     parsed.theme = parsed.theme || 'light';
+    parsed.pointTransactions = parsed.pointTransactions || [];
+    parsed.awardedKeys = parsed.awardedKeys || {};
     parsed = migrateToGenuineTracking(parsed);
+    parsed = migrateToUnifiedPoints(parsed);
     return parsed;
   }catch(e){ return freshState(); }
 }
@@ -765,7 +809,11 @@ function getSubjectProgress(subjectId){
     STATE.progress[subjectId] = freshProgressFor(subj);
     saveState();
   }
-  return STATE.progress[subjectId];
+  const p = STATE.progress[subjectId];
+  // Defensive backfill — covers any edge case the migration didn't reach.
+  if (!p.topicActiveSeconds) p.topicActiveSeconds = {};
+  if (!p.topicCompletionAwarded) p.topicCompletionAwarded = {};
+  return p;
 }
 function updateSubjectProgress(subjectId, patchFn){
   const p = getSubjectProgress(subjectId);
@@ -1262,6 +1310,7 @@ const UI = {
   trackDetail:null, tutorMessages:[], adminTab:'subjects',
   activeUploadId:null,
   feedbackTab:'submit', feedbackSubject: STATE.lastSubject || 'human-anatomy', feedbackRating:null, feedbackRecommend:undefined,
+  feedbackCategory: 'Question/MCQ Issue', feedbackDraftText: '',
 };
 
 function isLoggedIn(){ return !!(STATE.auth && STATE.auth.loggedIn); }
@@ -1371,7 +1420,7 @@ function renderDashboard(){
 function renderFeedbackLeaderboardSummary(){
   const studentId = currentStudentId();
   if (!studentId) return '';
-  const points = getStudentPoints(studentId);
+  const breakdown = getStudentPointBreakdown(studentId, 'all', 'all');
   const fbCount = getStudentFeedbackCount(studentId);
   const accepted = getStudentAcceptedCount(studentId);
   const rank = getStudentRank(studentId, 'all', 'all');
@@ -1380,13 +1429,13 @@ function renderFeedbackLeaderboardSummary(){
   return `<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-top:8px;">
     <div class="card" style="padding:20px;">
       <div class="eyebrow">FEEDBACK CONTRIBUTION</div>
-      <div style="display:flex;gap:24px;margin:12px 0;">${miniStat(fbCount,'Submitted')}${miniStat(accepted,'Accepted')}${miniStat(points,'Points')}</div>
+      <div style="display:flex;gap:24px;margin:12px 0;">${miniStat(fbCount,'Submitted')}${miniStat(accepted,'Accepted')}${miniStat(breakdown.feedback,'Feedback Points')}</div>
       <p class="empty-note" style="margin-bottom:12px;">Earn points by helping improve CLINOVA.</p>
       <button class="btn primary small" onclick="goRoute('feedback')">Give Feedback</button>
     </div>
     <div class="card" style="padding:20px;">
       <div class="eyebrow">LEADERBOARD</div>
-      <div style="display:flex;gap:24px;margin:12px 0;">${miniStat(rank?'#'+rank:'—','Your rank')}${miniStat(points,'Points')}${miniStat(collegeRank?'#'+collegeRank:'—','College rank')}</div>
+      <div style="display:flex;gap:24px;margin:12px 0;">${miniStat(rank?'#'+rank:'—','Your rank')}${miniStat(breakdown.total,'Total points')}${miniStat(collegeRank?'#'+collegeRank:'—','College rank')}</div>
       <p class="empty-note" style="margin-bottom:12px;">See how you compare to other students.</p>
       <button class="btn primary small" onclick="goRoute('leaderboard')">View Leaderboard</button>
     </div>
@@ -1483,16 +1532,31 @@ function renderTopicDetail(subjectId, topic){
   // student just switched the level pill), pick up mid-animation
   // instead of visually snapping back to 0% for a tick.
   const inProgressPct = (readingTopicKey === (subjectId + '|' + topic)) ? Math.round(readingProgressPct) : 0;
+  const activeSeconds = Math.min(p.topicActiveSeconds[topic]||0, TOPIC_COMPLETION_SECONDS);
+  const topicCompleted = !!p.topicCompletionAwarded[topic];
+  const timePct = Math.round((activeSeconds/TOPIC_COMPLETION_SECONDS)*100);
   return `
   <div class="page-head">
     <div><h1>${esc(topic)}</h1><div class="sub">${esc(subj.name)} · <span id="topic-mastery-label">${p.topicProgress[topic]}% mastery</span></div></div>
     <button class="btn ghost" onclick="UI.topicOpen=false;renderAll();">← ${esc(subj.name)} topics</button>
   </div>
-  <div class="card" id="reading-progress-card" style="padding:12px 16px;margin-bottom:18px;">
+  <div class="card" id="reading-progress-card" style="padding:12px 16px;margin-bottom:12px;">
     <div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--ink-soft);margin-bottom:6px;">
       <span>Reading progress</span><span id="reading-progress-label">${inProgressPct}%</span>
     </div>
     <div class="progress-track"><div class="progress-fill" id="reading-progress-fill" style="width:${inProgressPct}%;transition:width .2s linear;"></div></div>
+  </div>
+  <div class="card" id="topic-time-card" style="padding:12px 16px;margin-bottom:18px;">
+    ${topicCompleted
+      ? `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+           <span style="color:var(--success);font-weight:600;font-size:.86rem;">✓ Topic completed — you already earned the 15-minute completion reward for this topic.</span>
+         </div>`
+      : `<div style="display:flex;justify-content:space-between;font-size:.78rem;color:var(--ink-soft);margin-bottom:6px;">
+           <span>Leaderboard topic completion (active study time)</span><span id="topic-time-label">${formatMinSec(activeSeconds)} / 15:00</span>
+         </div>
+         <div class="progress-track"><div class="progress-fill success" id="topic-time-fill" style="width:${timePct}%;transition:width .3s linear;"></div></div>
+         <p class="empty-note" style="margin-top:6px;margin-bottom:0;">Counts only while this tab is visible and focused — reach 15 real minutes here to earn +${TOPIC_COMPLETION_POINTS} leaderboard points, once, ever.</p>`
+    }
   </div>
   <div class="pill-select" style="margin-bottom:18px;">${LEVELS.map(l=>`<button class="pill-option ${l===level?'active':''}" onclick="setLearnLevel('${l}')">${l}</button>`).join('')}</div>
   <div class="report-cols">
@@ -1601,6 +1665,88 @@ function completeReadingProgress(subjectId, topic){
     if (label) label.textContent = result.newValue + '% mastery';
   }
 }
+
+/* =============================================================
+   REAL TOPIC ACTIVE-TIME TRACKING — leaderboard topic completion
+   Distinct from the reading-progress/mastery-bump feature above
+   (that one is a daily engagement nudge; this one is a genuine,
+   one-time-ever wall-clock measurement gating a leaderboard reward).
+   Ticks only while the tab is actually visible AND the browser
+   window has focus, so background/inactive time is never counted.
+   Accumulated seconds persist across visits (close the tab at 7
+   minutes, come back later, it resumes from 7) — once a topic
+   crosses TOPIC_COMPLETION_SECONDS for the first time, it's marked
+   completed forever and the +10 leaderboard reward is paid exactly
+   once via awardPoints()'s reward-key guard.
+   ============================================================= */
+let topicTimeInterval = null;
+let topicTimeTarget = null; // { subjectId, topic } currently being tracked, or null
+
+function isPageActiveForTracking(){
+  return document.visibilityState === 'visible' && document.hasFocus();
+}
+function pauseTopicTimeTracker(){
+  if (topicTimeInterval){ clearInterval(topicTimeInterval); topicTimeInterval = null; }
+  saveState(); // flush whatever's accumulated so far — don't wait for the next 5-second batch
+}
+function stopTopicTimeTrackerCompletely(){
+  pauseTopicTimeTracker();
+  topicTimeTarget = null;
+}
+function startTopicTimeTracker(subjectId, topic){
+  stopTopicTimeTrackerCompletely();
+  const p = getSubjectProgress(subjectId);
+  if (p.topicCompletionAwarded[topic]) return; // nothing left to earn here — don't bother ticking
+  topicTimeTarget = { subjectId, topic };
+  resumeTopicTimeTrackerIfApplicable();
+}
+function resumeTopicTimeTrackerIfApplicable(){
+  if (!topicTimeTarget || topicTimeInterval) return;
+  if (!isPageActiveForTracking()) return;
+  const { subjectId, topic } = topicTimeTarget;
+  let ticksSinceSave = 0;
+  topicTimeInterval = setInterval(() => {
+    if (!topicTimeTarget || topicTimeTarget.subjectId!==subjectId || topicTimeTarget.topic!==topic){ pauseTopicTimeTracker(); return; }
+    if (!isPageActiveForTracking()){ pauseTopicTimeTracker(); return; }
+    const p = getSubjectProgress(subjectId);
+    if (p.topicCompletionAwarded[topic]){ pauseTopicTimeTracker(); return; }
+    p.topicActiveSeconds[topic] = (p.topicActiveSeconds[topic] || 0) + 1;
+    updateTopicTimeUI(subjectId, topic, p);
+    ticksSinceSave++;
+    if (ticksSinceSave >= 5){ saveState(); ticksSinceSave = 0; }
+    if (p.topicActiveSeconds[topic] >= TOPIC_COMPLETION_SECONDS){
+      saveState();
+      completeTopicTimeTracking(subjectId, topic);
+    }
+  }, 1000);
+}
+function formatMinSec(totalSeconds){ const m=Math.floor(totalSeconds/60), s=totalSeconds%60; return m+':'+String(s).padStart(2,'0'); }
+function updateTopicTimeUI(subjectId, topic, p){
+  const seconds = Math.min(p.topicActiveSeconds[topic]||0, TOPIC_COMPLETION_SECONDS);
+  const pctDone = Math.round((seconds/TOPIC_COMPLETION_SECONDS)*100);
+  const fill = document.getElementById('topic-time-fill');
+  const label = document.getElementById('topic-time-label');
+  if (fill) fill.style.width = pctDone + '%';
+  if (label) label.textContent = formatMinSec(seconds) + ' / 15:00';
+}
+function completeTopicTimeTracking(subjectId, topic){
+  const p = getSubjectProgress(subjectId);
+  if (p.topicCompletionAwarded[topic]) return; // safety — never pay twice
+  p.topicCompletionAwarded[topic] = true;
+  saveState();
+  pauseTopicTimeTracker();
+  const studentId = currentStudentId();
+  const awarded = studentId
+    ? awardPoints(studentId, 'topic_completion', TOPIC_COMPLETION_POINTS, { subjectId, topicId: topic }, studentId+'_'+subjectId+'_'+topic+'_topic_completion')
+    : null;
+  const card = document.getElementById('topic-time-card');
+  if (card){
+    card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <span style="color:var(--success);font-weight:600;font-size:.86rem;">✓ Topic completed — 15 minutes of active study reached${awarded ? ` — +${TOPIC_COMPLETION_POINTS} leaderboard points earned!` : ''}</span>
+    </div>`;
+  }
+}
+
 function topicConcept(subj, topic, level){
   const flavor = {
     'Beginner': `Think of ${topic} in the simplest terms first — the "what" and "why" before the details.`,
@@ -1689,7 +1835,12 @@ function startQuiz(subject, topic, difficulty, count, examType){
   STATE.lastMCQSessionIds = STATE.lastMCQSessionIds || {};
   const previousIds = STATE.lastMCQSessionIds[sessionKey] || [];
   const questions = generateMCQs(subject, topic, difficulty, examType, count, { previousQuestionIds: previousIds });
-  UI.quiz = { subject, topic, difficulty, examType, total:count, index:0, correctCount:0, questions, current: questions[0], answered:false, selected:null };
+  // A stable, unique session id generated ONCE at start — this is the
+  // reward key quiz points are tied to, so no repeated event firing
+  // (refresh, double-click, re-render) can ever pay quiz points twice
+  // for the same session.
+  const sessionId = 'quiz_' + subject + '_' + (topic||'any') + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+  UI.quiz = { subject, topic, difficulty, examType, total:count, index:0, correctCount:0, questions, current: questions[0], answered:false, selected:null, sessionId };
   renderAll();
 }
 function renderQuiz(){
@@ -1720,9 +1871,19 @@ function nextQuizQuestion(){
     STATE.lastMCQSessionIds = STATE.lastMCQSessionIds || {};
     STATE.lastMCQSessionIds[sessionKey] = quiz.questions.map(q=>q.id);
     saveState();
-    const score=Math.round((quiz.correctCount/quiz.total)*100); UI.quiz=null;
+    const score=Math.round((quiz.correctCount/quiz.total)*100);
+    // Quiz points (§7/§9): scales with the existing score percentage,
+    // paid exactly once per session via the sessionId reward key.
+    const studentId = currentStudentId();
+    let quizPoints = 0;
+    if (studentId){
+      quizPoints = Math.round((quiz.correctCount/quiz.total) * QUIZ_POINTS_MAX);
+      awardPoints(studentId, 'quiz', quizPoints, { subjectId: quiz.subject, topicId: quiz.topic||null, activityId: quiz.sessionId }, studentId+'_'+quiz.sessionId+'_quiz');
+    }
+    UI.quiz=null;
     document.getElementById('practice-body').innerHTML = `<div class="card" style="padding:26px;max-width:520px;">
       <h2>Session complete</h2><p style="margin:10px 0;">You scored <b>${quiz.correctCount}/${quiz.total}</b> (${score}%).</p>${progressBar(score)}
+      ${quizPoints>0 ? `<p style="font-size:.86rem;color:var(--success);font-weight:600;">+${quizPoints} quiz points earned.</p>` : ''}
       <div style="margin-top:18px;display:flex;gap:10px;"><button class="btn primary" onclick="setPracticeTab('mcq')">Practise again</button><button class="btn" onclick="goRoute('track')">View progress</button></div></div>`;
     return;
   }
@@ -1909,7 +2070,11 @@ function beginMockFromForm(){
   const count=parseInt(document.getElementById('mock-count').value,10), diff=document.getElementById('mock-diff').value;
   UI.subject=subject; saveState();
   const questions = generateMCQs(subject, null, diff, exam, count);
-  UI.mock = { exam, subject, diff, questions, answers:new Array(count).fill(null), marked:new Array(count).fill(false), index:0, timeLeft: count*45, timerId:null, submitted:false };
+  // Stable session id generated once, at start — the reward key test
+  // points are tied to, so a page refresh/double-submit/timer-driven
+  // auto-submit can never pay test points twice for the same attempt.
+  const sessionId = 'test_' + subject + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+  UI.mock = { exam, subject, diff, questions, answers:new Array(count).fill(null), marked:new Array(count).fill(false), index:0, timeLeft: count*45, timerId:null, submitted:false, sessionId };
   renderAll();
   tickMockTimer();
 }
@@ -1976,6 +2141,16 @@ function submitMock(){
     Object.entries(topicTally).forEach(([t,v])=>{ if (p.topicProgress[t]!==undefined && v.total){ p.topicProgress[t] = pct((p.topicProgress[t] + Math.round((v.correct/v.total)*100))/2); } });
   });
   recordActivity();
+  // Test points (§8/§9): scales with the existing score percentage,
+  // paid exactly once per attempt via the sessionId reward key — safe
+  // against the timer auto-submitting AND a manual "Submit now" click
+  // racing each other, since m.submitted is already checked above.
+  const studentId = currentStudentId();
+  let testPoints = 0;
+  if (studentId){
+    testPoints = Math.round((correct/total) * TEST_POINTS_MAX);
+    awardPoints(studentId, 'test', testPoints, { subjectId: m.subject, activityId: m.sessionId }, studentId+'_'+m.sessionId+'_test');
+  }
   const weakTopics = Object.entries(topicTally).filter(([t,v])=>v.total && (v.correct/v.total)<0.6).map(([t])=>t);
   const bodyEl = document.getElementById('practice-body');
   if (!bodyEl) return; // student navigated away before the timer ran out; progress above is already saved
@@ -1983,6 +2158,7 @@ function submitMock(){
   <div class="card" style="padding:26px;max-width:640px;">
     <h2>SCORE</h2>
     <div style="font-family:var(--display);font-size:2.2rem;font-weight:700;color:var(--primary);margin-top:6px;">${score}/100</div>
+    ${testPoints>0 ? `<p style="font-size:.86rem;color:var(--success);font-weight:600;margin-top:6px;">+${testPoints} test points earned.</p>` : ''}
     <div class="grid stat-row" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-top:16px;">
       <div class="card stat-card"><div class="num">${correct}</div><div class="lbl">Correct</div></div>
       <div class="card stat-card"><div class="num">${incorrect}</div><div class="lbl">Incorrect</div></div>
@@ -2562,8 +2738,11 @@ function askUploadQuestion(upload, question){
    have actually been used here, never randomly generated ones.
    ============================================================= */
 const FEEDBACK_CATEGORIES = ['Question/MCQ Issue','Flashcard Issue','Content/Medical Information Issue','AI Tutor Issue','Technical/Bug Issue','UI/Design Suggestion','Feature Request','Other'];
-const FEEDBACK_DAILY_POINT_CAP = 50;
-const FEEDBACK_ACCEPT_BONUS = 25;
+const FEEDBACK_POINTS = 20;          // every valid submission earns exactly this, no cap, no daily limit — multiple submissions all count
+const QUIZ_POINTS_MAX = 20;          // points for a perfect (100%) MCQ practice session; scales down with score — change this one constant to retune quiz rewards
+const TEST_POINTS_MAX = 50;          // points for a perfect (100%) mock test; scales down with score — change this one constant to retune test rewards
+const TOPIC_COMPLETION_SECONDS = 15 * 60; // 15 real, active minutes required
+const TOPIC_COMPLETION_POINTS = 10;       // paid exactly once per student+subject+topic
 
 function currentStudentId(){ return (STATE.auth.profile && STATE.auth.profile.email) ? STATE.auth.profile.email.toLowerCase() : null; }
 function registerStudentInDirectory(profile){
@@ -2579,66 +2758,106 @@ function registerStudentInDirectory(profile){
   saveState();
 }
 
-function normalizeFeedbackText(t){ return (t||'').toLowerCase().trim().replace(/\s+/g,' '); }
-function isDuplicateFeedbackSubmission(studentId, text){
-  const norm = normalizeFeedbackText(text);
-  return (STATE.feedback||[]).some(f => f.studentId===studentId && normalizeFeedbackText(f.text)===norm);
+/* =============================================================
+   UNIFIED POINT-TRANSACTION LEDGER
+   Single source of truth for the entire leaderboard score. Every
+   point of every kind (topic completion, feedback, quiz, test) is
+   recorded as one immutable transaction here — nothing sums a
+   mutable counter anywhere else. This is what makes time-period
+   filtering possible (§12) and duplicate-award prevention reliable
+   (§14): a reward is only ever paid once per unique "reward key",
+   checked via STATE.awardedKeys before the transaction is created.
+   ============================================================= */
+function awardPoints(studentId, type, points, meta, rewardKey){
+  if (!studentId || !points || points <= 0) return null;
+  STATE.awardedKeys = STATE.awardedKeys || {};
+  if (rewardKey && STATE.awardedKeys[rewardKey]) return null; // already paid — refuse silently, this is the anti-duplicate guard
+  meta = meta || {};
+  const dir = (STATE.students && STATE.students[studentId]) || STATE.auth.profile || {};
+  const tx = {
+    id: 'tx_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
+    studentId, type, points,
+    subjectId: meta.subjectId || null, topicId: meta.topicId || null, activityId: meta.activityId || rewardKey || null,
+    studentYear: dir.year || null, studentCollege: dir.college || null,
+    timestamp: new Date().toISOString(),
+  };
+  STATE.pointTransactions = STATE.pointTransactions || [];
+  STATE.pointTransactions.push(tx);
+  if (rewardKey) STATE.awardedKeys[rewardKey] = tx.id;
+  saveState();
+  return tx;
 }
-function studentPointsEarnedToday(studentId){
-  const today = new Date().toISOString().slice(0,10);
-  return (STATE.feedback||[]).filter(f => f.studentId===studentId && (f.createdAt||'').slice(0,10)===today)
-    .reduce((a,f)=>a+(f.pointsAwarded||0), 0);
+function filterTransactionsByPeriod(txs, period){
+  if (!period || period==='all') return txs;
+  const now = new Date();
+  return txs.filter(t=>{
+    const d = new Date(t.timestamp);
+    if (isNaN(d)) return false;
+    if (period==='month') return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
+    if (period==='week'){ const diffDays=(now-d)/(1000*60*60*24); return diffDays>=0 && diffDays<=7; }
+    return true;
+  });
 }
-/* Simple, explainable quality heuristic (CHANGE 12) — a real backend
-   could later replace this with a proper NLP classifier, but the
-   shape (category/subject/topic/rating/text -> a point value) stays
-   the same. */
-function calculateFeedbackPoints(fb){
-  const text = (fb.text||'').trim();
-  if (text.length < 10) return 0; // too short to be useful — no points
-  const actionable = /\b(should|please|repeat|repeated|duplicate|error|incorrect|wrong|suggest|instead|missing|clarify|fix|expected|confusing)\b/i.test(text);
-  const detailed = text.length >= 80;
-  const hasRatingAndExplanation = !!fb.rating && text.length >= 20;
-  let points = 10; // baseline valid feedback
-  if (detailed && actionable) points = 15;
-  else if (detailed || actionable) points = 12;
-  if (hasRatingAndExplanation) points = Math.max(points, 12);
-  return points;
+function getStudentPointBreakdown(studentId, period, year){
+  let txs = (STATE.pointTransactions||[]).filter(t=>t.studentId===studentId);
+  txs = filterTransactionsByPeriod(txs, period||'all');
+  if (year && year!=='all') txs = txs.filter(t=>t.studentYear===year);
+  const sum = (type) => txs.filter(t=>t.type===type).reduce((a,t)=>a+t.points,0);
+  return {
+    feedback: sum('feedback'), topic: sum('topic_completion'), quiz: sum('quiz'), test: sum('test'),
+    total: txs.reduce((a,t)=>a+t.points,0),
+    feedbackCount: txs.filter(t=>t.type==='feedback').length,
+  };
 }
-/* CHANGE 3/4 — submits one feedback item, applying the point/anti-spam
-   rules, and returns the stored feedback object (or null if the
-   student isn't logged in). */
+function getStudentPoints(studentId, period, year){ return getStudentPointBreakdown(studentId, period||'all', year||'all').total; }
+function getStudentFeedbackCount(studentId){ return (STATE.feedback||[]).filter(f=>f.studentId===studentId).length; }
+function getStudentAcceptedCount(studentId){ return (STATE.feedback||[]).filter(f=>f.studentId===studentId && f.status==='Accepted').length; }
+
+/* =============================================================
+   FEEDBACK
+   Every VALID submission (i.e. it actually went through the form,
+   which already requires non-empty text) earns a flat, unlimited
+   +20 — no quality heuristic, no daily cap, no duplicate-text check.
+   The debounce flag below is the only anti-duplicate guard needed
+   here, and it protects against a genuine double-fire (e.g. a fast
+   double-click) rather than against submitting similar feedback
+   twice on purpose, which the student is explicitly allowed to do.
+   ============================================================= */
+let feedbackSubmitInFlight = false;
 function submitFeedback({ category, subject, topic, text, rating, recommend }){
   const studentId = currentStudentId();
   if (!studentId) { alert('Please log in to submit feedback.'); return null; }
-  const prof = STATE.auth.profile;
-  const duplicate = isDuplicateFeedbackSubmission(studentId, text);
-  let points = duplicate ? 0 : calculateFeedbackPoints({ category, text, rating, recommend });
-  if (!duplicate && points > 0){
-    const remaining = Math.max(0, FEEDBACK_DAILY_POINT_CAP - studentPointsEarnedToday(studentId));
-    points = Math.min(points, remaining);
+  if (feedbackSubmitInFlight) return null;
+  feedbackSubmitInFlight = true;
+  try{
+    const prof = STATE.auth.profile;
+    const needsSubjectTopic = category === 'Question/MCQ Issue';
+    const fb = {
+      id: 'fb_'+Date.now()+'_'+Math.random().toString(36).slice(2,7),
+      studentId, studentName: prof.name||'', college: prof.college||'', university: prof.university||'', year: prof.year||'',
+      category, subject: needsSubjectTopic ? (subject||'') : '', topic: needsSubjectTopic ? (topic||'') : '',
+      text, rating: rating||null, recommend: (recommend===true||recommend===false) ? recommend : null,
+      pointsAwarded: FEEDBACK_POINTS,
+      status: 'Pending', createdAt: new Date().toISOString(),
+    };
+    STATE.feedback = STATE.feedback || [];
+    STATE.feedback.push(fb);
+    saveState();
+    awardPoints(studentId, 'feedback', FEEDBACK_POINTS, { subjectId: fb.subject||null, activityId: fb.id }, 'feedback_' + fb.id);
+    return fb;
+  } finally {
+    feedbackSubmitInFlight = false;
   }
-  const fb = {
-    id: 'fb_'+Date.now()+'_'+Math.random().toString(36).slice(2,7),
-    studentId, studentName: prof.name||'', college: prof.college||'', university: prof.university||'', year: prof.year||'',
-    category, subject: subject||'', topic: topic||'',
-    text, rating: rating||null, recommend: (recommend===true||recommend===false) ? recommend : null,
-    pointsAwarded: points, bonusAwarded: false,
-    status: 'Pending', createdAt: new Date().toISOString(),
-  };
-  STATE.feedback = STATE.feedback || [];
-  STATE.feedback.push(fb);
-  saveState();
-  return fb;
 }
-/* CHANGE 11 — admin actions. acceptFeedback() awards the accepted-
-   feedback bonus exactly once, guarded by bonusAwarded, so clicking
-   Accept repeatedly can never double-award points. */
+/* Admin status actions. Per the current scoring model, feedback points
+   are paid in full at submission time (see submitFeedback above) —
+   accepting/rejecting only changes the review status shown to the
+   student, it no longer pays an additional bonus (avoids double-
+   counting against the unified ledger's flat +20-per-submission rule). */
 function acceptFeedback(feedbackId){
   const fb = (STATE.feedback||[]).find(f=>f.id===feedbackId);
   if (!fb) return;
   fb.status = 'Accepted';
-  if (!fb.bonusAwarded){ fb.pointsAwarded = (fb.pointsAwarded||0) + FEEDBACK_ACCEPT_BONUS; fb.bonusAwarded = true; }
   saveState();
 }
 function rejectFeedback(feedbackId){
@@ -2654,59 +2873,51 @@ function markFeedbackReviewed(feedbackId){
   saveState();
 }
 
-function getStudentPoints(studentId){ return (STATE.feedback||[]).filter(f=>f.studentId===studentId).reduce((a,f)=>a+(f.pointsAwarded||0),0); }
-function getStudentFeedbackCount(studentId){ return (STATE.feedback||[]).filter(f=>f.studentId===studentId).length; }
-function getStudentAcceptedCount(studentId){ return (STATE.feedback||[]).filter(f=>f.studentId===studentId && f.status==='Accepted').length; }
-
-function filterFeedbackByPeriod(feedback, period){
-  if (!period || period==='all') return feedback;
-  const now = new Date();
-  return feedback.filter(f=>{
-    const d = new Date(f.createdAt);
-    if (isNaN(d)) return false;
-    if (period==='month') return d.getFullYear()===now.getFullYear() && d.getMonth()===now.getMonth();
-    if (period==='week'){ const diffDays=(now-d)/(1000*60*60*24); return diffDays>=0 && diffDays<=7; }
-    return true;
-  });
-}
-/* CHANGE 6/19 — real-data-only leaderboards. Built entirely from
-   STATE.feedback (+ STATE.students for the directory of who exists),
-   never randomly generated. Sort: points desc, accepted desc,
-   total feedback desc, name/college alphabetical as final tiebreak. */
+/* =============================================================
+   LEADERBOARDS — built entirely from STATE.pointTransactions (never
+   randomly generated). Sort: total points desc, name/college
+   alphabetical as the final tiebreak.
+   ============================================================= */
 function getStudentLeaderboard(period, year){
-  let fb = filterFeedbackByPeriod(STATE.feedback||[], period||'all');
-  if (year && year!=='all') fb = fb.filter(f=>f.year===year);
+  let txs = filterTransactionsByPeriod(STATE.pointTransactions||[], period||'all');
+  if (year && year!=='all') txs = txs.filter(t=>t.studentYear===year);
   const map = {};
-  fb.forEach(f=>{
-    if (!map[f.studentId]) map[f.studentId] = { studentId:f.studentId, name:f.studentName, college:f.college, university:f.university, feedbackCount:0, acceptedCount:0, points:0 };
-    map[f.studentId].feedbackCount++;
-    if (f.status==='Accepted') map[f.studentId].acceptedCount++;
-    map[f.studentId].points += (f.pointsAwarded||0);
+  txs.forEach(t=>{
+    if (!map[t.studentId]){
+      const dir = STATE.students[t.studentId];
+      map[t.studentId] = { studentId:t.studentId, name:dir?dir.name:t.studentId, college:dir?dir.college:(t.studentCollege||''), feedback:0, topic:0, quiz:0, test:0, total:0, feedbackCount:0 };
+    }
+    const row = map[t.studentId];
+    const bucket = t.type==='topic_completion' ? 'topic' : t.type;
+    if (row[bucket] !== undefined) row[bucket] += t.points;
+    row.total += t.points;
+    if (t.type==='feedback') row.feedbackCount++;
   });
-  // The logged-in student always appears (even with zero feedback so far) so their rank always resolves.
+  // The logged-in student always appears (even with zero points so far) so their rank always resolves.
   const me = currentStudentId();
   if (me && !map[me] && STATE.auth.profile && (!year || year==='all' || STATE.auth.profile.year===year)){
-    map[me] = { studentId:me, name:STATE.auth.profile.name, college:STATE.auth.profile.college, university:STATE.auth.profile.university, feedbackCount:0, acceptedCount:0, points:0 };
+    map[me] = { studentId:me, name:STATE.auth.profile.name, college:STATE.auth.profile.college, feedback:0, topic:0, quiz:0, test:0, total:0, feedbackCount:0 };
   }
   const list = Object.values(map);
-  list.sort((a,b)=> b.points-a.points || b.acceptedCount-a.acceptedCount || b.feedbackCount-a.feedbackCount || (a.name||'').localeCompare(b.name||''));
+  list.sort((a,b)=> b.total-a.total || (a.name||'').localeCompare(b.name||''));
   list.forEach((row,i)=>row.rank=i+1);
   return list;
 }
 function getCollegeLeaderboard(period, year){
-  let fb = filterFeedbackByPeriod(STATE.feedback||[], period||'all');
-  if (year && year!=='all') fb = fb.filter(f=>f.year===year);
+  let txs = filterTransactionsByPeriod(STATE.pointTransactions||[], period||'all');
+  if (year && year!=='all') txs = txs.filter(t=>t.studentYear===year);
   const map = {};
-  fb.forEach(f=>{
-    const college = f.college || 'Unspecified';
-    if (!map[college]) map[college] = { college, students:new Set(), feedbackCount:0, acceptedCount:0, points:0 };
-    map[college].students.add(f.studentId);
-    map[college].feedbackCount++;
-    if (f.status==='Accepted') map[college].acceptedCount++;
-    map[college].points += (f.pointsAwarded||0);
+  txs.forEach(t=>{
+    const college = t.studentCollege || 'Unspecified';
+    if (!map[college]) map[college] = { college, students:new Set(), feedback:0, topic:0, quiz:0, test:0, total:0 };
+    const row = map[college];
+    row.students.add(t.studentId);
+    const bucket = t.type==='topic_completion' ? 'topic' : t.type;
+    if (row[bucket] !== undefined) row[bucket] += t.points;
+    row.total += t.points;
   });
-  const list = Object.values(map).map(c=>({ college:c.college, studentsCount:c.students.size, feedbackCount:c.feedbackCount, acceptedCount:c.acceptedCount, points:c.points }));
-  list.sort((a,b)=> b.points-a.points || b.acceptedCount-a.acceptedCount || b.feedbackCount-a.feedbackCount || a.college.localeCompare(b.college));
+  const list = Object.values(map).map(c=>({ college:c.college, studentsCount:c.students.size, feedback:c.feedback, topic:c.topic, quiz:c.quiz, test:c.test, total:c.total }));
+  list.sort((a,b)=> b.total-a.total || a.college.localeCompare(b.college));
   list.forEach((row,i)=>row.rank=i+1);
   return list;
 }
@@ -2981,27 +3192,38 @@ function renderFeedbackBody(){
 function renderFeedbackForm(){
   const feedbackSubjectId = UI.feedbackSubject || UI.subject;
   const subj = getSubject(feedbackSubjectId) || allSubjects()[0];
+  const currentCategory = UI.feedbackCategory || FEEDBACK_CATEGORIES[0];
+  const showSubjectTopic = currentCategory === 'Question/MCQ Issue';
   return `<div class="card" style="padding:22px;max-width:640px;">
     <div class="field" style="margin-bottom:14px;"><label>Category</label>
-      <select id="fb-category">${FEEDBACK_CATEGORIES.map(c=>`<option>${esc(c)}</option>`).join('')}</select></div>
-    <div class="field-row" style="margin-bottom:14px;">
+      <select id="fb-category" onchange="onFeedbackCategoryChange()">${FEEDBACK_CATEGORIES.map(c=>`<option ${c===currentCategory?'selected':''}>${esc(c)}</option>`).join('')}</select></div>
+    ${showSubjectTopic ? `<div class="field-row" style="margin-bottom:14px;" id="fb-subject-topic-row">
       <div class="field"><label>Subject</label><select id="fb-subject" onchange="onFeedbackSubjectChange()">${allSubjects().map(s=>`<option value="${s.id}" ${s.id===subj.id?'selected':''}>${esc(s.name)}</option>`).join('')}</select></div>
       <div class="field"><label>Topic (optional)</label><select id="fb-topic"><option value="">— None —</option>${subj.topics.map(t=>`<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('')}</select></div>
-    </div>
-    <div class="field" style="margin-bottom:14px;"><label>Feedback</label><textarea id="fb-text" rows="4" placeholder="Describe the issue or suggestion in detail — specific, actionable feedback earns more points."></textarea></div>
+    </div>` : ''}
+    <div class="field" style="margin-bottom:14px;"><label>Feedback</label><textarea id="fb-text" rows="4" placeholder="Describe the issue or suggestion in detail — specific, actionable feedback earns more points.">${esc(UI.feedbackDraftText||'')}</textarea></div>
     <div class="field-row" style="margin-bottom:18px;">
       <div class="field"><label>Rating (optional)</label>
-        <div class="pill-select" id="fb-rating-stars">${[1,2,3,4,5].map(n=>`<button type="button" class="pill-option" data-star="${n}" onclick="setFeedbackRating(${n})">${'★'.repeat(n)}</button>`).join('')}</div>
+        <div class="pill-select" id="fb-rating-stars">${[1,2,3,4,5].map(n=>`<button type="button" class="pill-option ${UI.feedbackRating>=n?'active':''}" data-star="${n}" onclick="setFeedbackRating(${n})">${'★'.repeat(n)}</button>`).join('')}</div>
       </div>
       <div class="field"><label>Would you recommend this feature?</label>
-        <div class="pill-select"><button type="button" class="pill-option" id="fb-recommend-yes" onclick="setFeedbackRecommend(true)">Yes</button><button type="button" class="pill-option" id="fb-recommend-no" onclick="setFeedbackRecommend(false)">No</button></div>
+        <div class="pill-select"><button type="button" class="pill-option ${UI.feedbackRecommend===true?'active':''}" id="fb-recommend-yes" onclick="setFeedbackRecommend(true)">Yes</button><button type="button" class="pill-option ${UI.feedbackRecommend===false?'active':''}" id="fb-recommend-no" onclick="setFeedbackRecommend(false)">No</button></div>
       </div>
     </div>
     <button class="btn primary" onclick="handleSubmitFeedback()">Submit Feedback</button>
     <div id="feedback-submit-result" style="margin-top:14px;"></div>
   </div>`;
 }
-function onFeedbackSubjectChange(){ UI.feedbackSubject = document.getElementById('fb-subject').value; renderAll(); }
+/* Conditional Subject/Topic — only meaningful for an MCQ/Question issue.
+   Re-renders the form immediately on category change (no page reload,
+   no stale fields left behind) and preserves whatever the student had
+   already typed in the feedback text box. */
+function onFeedbackCategoryChange(){
+  UI.feedbackCategory = document.getElementById('fb-category').value;
+  UI.feedbackDraftText = document.getElementById('fb-text') ? document.getElementById('fb-text').value : (UI.feedbackDraftText||'');
+  renderAll();
+}
+function onFeedbackSubjectChange(){ UI.feedbackSubject = document.getElementById('fb-subject').value; UI.feedbackDraftText = document.getElementById('fb-text') ? document.getElementById('fb-text').value : (UI.feedbackDraftText||''); renderAll(); }
 function setFeedbackRating(n){
   UI.feedbackRating = (UI.feedbackRating===n) ? null : n;
   document.querySelectorAll('#fb-rating-stars .pill-option').forEach(b=>b.classList.toggle('active', UI.feedbackRating!==null && Number(b.dataset.star)<=UI.feedbackRating));
@@ -3013,35 +3235,47 @@ function setFeedbackRecommend(val){
 }
 function handleSubmitFeedback(){
   const category = document.getElementById('fb-category').value;
-  const subjectId = document.getElementById('fb-subject').value;
-  const topic = document.getElementById('fb-topic').value || null;
+  const needsSubjectTopic = category === 'Question/MCQ Issue';
+  const subjectId = needsSubjectTopic ? document.getElementById('fb-subject').value : null;
+  const topic = needsSubjectTopic ? (document.getElementById('fb-topic').value || null) : null;
   const text = document.getElementById('fb-text').value.trim();
   if (!text){ alert('Please describe your feedback before submitting.'); return; }
+  if (needsSubjectTopic && !subjectId){ alert('Please select a subject for a Question/MCQ Issue.'); return; }
   const fb = submitFeedback({ category, subject: subjectId, topic, text, rating: UI.feedbackRating||null, recommend: UI.feedbackRecommend });
   if (!fb) return;
   document.getElementById('feedback-submit-result').innerHTML = `<div class="card" style="padding:14px 16px;background:var(--teal-tint);border-color:var(--teal);">
     <b style="color:var(--teal);">Thank you! Your feedback has been submitted.</b>
-    ${fb.pointsAwarded>0 ? `<div style="margin-top:4px;font-size:.85rem;color:var(--ink-soft);">+${fb.pointsAwarded} points earned.</div>` : `<div style="margin-top:4px;font-size:.85rem;color:var(--ink-soft);">No points awarded this time (duplicate feedback, or you've reached today's point cap).</div>`}
+    <div style="margin-top:4px;font-size:.85rem;color:var(--ink-soft);">+${fb.pointsAwarded} points earned.</div>
   </div>`;
   document.getElementById('fb-text').value = '';
-  UI.feedbackRating = null; UI.feedbackRecommend = undefined;
+  UI.feedbackDraftText = ''; UI.feedbackRating = null; UI.feedbackRecommend = undefined;
   pushNotification('Feedback submitted — thank you for helping improve CLINOVA.');
 }
 function renderMyFeedback(){
   const studentId = currentStudentId();
   const mine = (STATE.feedback||[]).filter(f=>f.studentId===studentId).sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt));
   if (!mine.length) return `<p class="empty-note">You haven't submitted any feedback yet.</p>`;
-  return `<div>${mine.map(f=>`<div class="card" style="padding:16px;margin-bottom:10px;">
+  return `<div>${mine.map(f=>{
+    const subj = f.subject ? getSubject(f.subject) : null;
+    const metaBits = [];
+    if (subj) metaBits.push(subj.name);
+    if (f.topic) metaBits.push(f.topic);
+    if (f.rating) metaBits.push('★'.repeat(f.rating));
+    if (f.recommend===true) metaBits.push('Would recommend');
+    if (f.recommend===false) metaBits.push('Would not recommend');
+    return `<div class="card" style="padding:16px;margin-bottom:10px;">
     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
       <span class="tag">${esc(f.category)}</span>
       <span class="tag status ${f.status==='Accepted'?'success':f.status==='Rejected'?'coral':'gold'}">${esc(f.status)}</span>
     </div>
-    <p style="margin-top:10px;font-size:.9rem;">${esc(f.text)}</p>
+    ${metaBits.length ? `<div class="eyebrow" style="margin-top:8px;">${metaBits.map(esc).join(' · ')}</div>` : ''}
+    <p style="margin-top:8px;font-size:.9rem;">${esc(f.text)}</p>
     <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:.78rem;color:var(--ink-soft);">
-      <span>${f.pointsAwarded>0 ? '+' + f.pointsAwarded + ' points' : '0 points'}</span>
+      <span style="color:var(--success);font-weight:600;">+${f.pointsAwarded} points</span>
       <span>${new Date(f.createdAt).toLocaleDateString()}</span>
     </div>
-  </div>`).join('')}</div>`;
+  </div>`;
+  }).join('')}</div>`;
 }
 
 /* =============================================================
@@ -3074,35 +3308,41 @@ function renderYourLeaderboardPosition(ls){
   if (!me) return '';
   const above = list.find(r=>r.rank===me.rank-1);
   const awayText = me.rank===1 ? 'You are currently #1. Keep contributing!'
-    : above ? `You are ${Math.max(0, above.points-me.points)} points away from #${above.rank}.` : '';
-  return `<div class="card" style="padding:18px 22px;margin-bottom:20px;display:flex;gap:26px;flex-wrap:wrap;align-items:center;background:var(--primary-tint);border-color:var(--primary);">
-    <div><div class="eyebrow">YOUR RANK</div><div style="font-family:var(--display);font-size:1.6rem;font-weight:700;color:var(--primary);">#${me.rank}</div></div>
-    <div><div class="eyebrow">FEEDBACK POINTS</div><div style="font-family:var(--display);font-size:1.6rem;font-weight:700;">${me.points}</div></div>
-    <div style="flex:1;min-width:200px;font-size:.86rem;color:var(--ink-soft);">${esc(awayText)}</div>
+    : above ? `You are ${Math.max(0, above.total-me.total)} points away from #${above.rank}.` : '';
+  const miniStat = (num,lbl) => `<div><div class="eyebrow">${lbl}</div><div style="font-family:var(--display);font-size:1.15rem;font-weight:700;">${num}</div></div>`;
+  return `<div class="card" style="padding:18px 22px;margin-bottom:20px;background:var(--primary-tint);border-color:var(--primary);">
+    <div style="display:flex;gap:26px;flex-wrap:wrap;align-items:center;">
+      <div><div class="eyebrow">YOUR RANK</div><div style="font-family:var(--display);font-size:1.6rem;font-weight:700;color:var(--primary);">#${me.rank}</div></div>
+      <div><div class="eyebrow">TOTAL POINTS</div><div style="font-family:var(--display);font-size:1.6rem;font-weight:700;">${me.total}</div></div>
+      <div style="flex:1;min-width:200px;font-size:.86rem;color:var(--ink-soft);">${esc(awayText)}</div>
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid rgba(45,62,140,.15);">
+      ${miniStat(me.feedback,'Feedback Points')}${miniStat(me.topic,'Topic Points')}${miniStat(me.quiz,'Quiz Points')}${miniStat(me.test,'Test Points')}
+    </div>
   </div>`;
 }
 function renderStudentLeaderboardTable(ls){
   const list = getStudentLeaderboard(ls.period, ls.year);
-  const meaningful = list.filter(r=>r.feedbackCount>0);
-  if (!meaningful.length && list.length<=1) return `<p class="empty-note">No feedback has been submitted yet — be the first to appear on the leaderboard.</p>`;
+  const hasActivity = list.some(r=>r.total>0);
+  if (!hasActivity) return `<p class="empty-note">No leaderboard activity yet. Complete topics, quizzes, tests, or submit feedback to earn points.</p>`;
   return `<div class="card" style="overflow-x:auto;">
-    <table class="track-table"><thead><tr><th>Rank</th><th>Student</th><th>College</th><th>Feedback</th><th>Accepted</th><th>Points</th></tr></thead>
+    <table class="track-table"><thead><tr><th>Rank</th><th>Student</th><th>College</th><th>Feedback</th><th>Topic</th><th>Quiz</th><th>Test</th><th>Total</th></tr></thead>
     <tbody>${list.map(r=>`<tr ${r.studentId===currentStudentId()?'style="background:var(--primary-tint);"':''}>
       <td>#${r.rank}</td><td class="subj-name">${esc(r.name||'—')}</td><td>${esc(r.college||'—')}</td>
-      <td>${r.feedbackCount}</td><td>${r.acceptedCount}</td><td><b>${r.points}</b></td>
+      <td>${r.feedback}</td><td>${r.topic}</td><td>${r.quiz}</td><td>${r.test}</td><td><b>${r.total}</b></td>
     </tr>`).join('')}</tbody></table>
   </div>`;
 }
 function renderCollegeLeaderboardTable(ls){
   const list = getCollegeLeaderboard(ls.period, ls.year);
-  if (!list.length) return `<p class="empty-note">No feedback has been submitted yet — colleges will appear here once students start contributing.</p>`;
+  if (!list.length) return `<p class="empty-note">No leaderboard activity yet. Complete topics, quizzes, tests, or submit feedback to earn points.</p>`;
   const periodLabel = ls.period==='month' ? 'this month' : ls.period==='week' ? 'this week' : 'all time';
   return `<div class="card" style="padding:14px 18px;margin-bottom:16px;background:var(--gold-tint);border-color:var(--gold);display:flex;align-items:center;gap:10px;">
     <span style="font-size:1.3rem;">🏆</span><div><b>#1 Most Active College — ${esc(list[0].college)}</b><div style="font-size:.8rem;color:var(--ink-soft);">Top contributing college ${periodLabel}.</div></div>
   </div>
   <div class="card" style="overflow-x:auto;">
-    <table class="track-table"><thead><tr><th>Rank</th><th>College</th><th>Students</th><th>Feedback</th><th>Accepted</th><th>Points</th></tr></thead>
-    <tbody>${list.map(r=>`<tr><td>#${r.rank}</td><td class="subj-name">${esc(r.college)}${r.rank===1?' 🏆':''}</td><td>${r.studentsCount}</td><td>${r.feedbackCount}</td><td>${r.acceptedCount}</td><td><b>${r.points}</b></td></tr>`).join('')}</tbody></table>
+    <table class="track-table"><thead><tr><th>Rank</th><th>College</th><th>Students</th><th>Feedback</th><th>Topic</th><th>Quiz</th><th>Test</th><th>Total</th></tr></thead>
+    <tbody>${list.map(r=>`<tr><td>#${r.rank}</td><td class="subj-name">${esc(r.college)}${r.rank===1?' 🏆':''}</td><td>${r.studentsCount}</td><td>${r.feedback}</td><td>${r.topic}</td><td>${r.quiz}</td><td>${r.test}</td><td><b>${r.total}</b></td></tr>`).join('')}</tbody></table>
   </div>`;
 }
 
@@ -3287,6 +3527,15 @@ function renderAll(){
   } else if (readingTopicKey){
     stopReadingProgress(); readingTopicKey = null;
   }
+
+  // Same on/off condition, separate lifecycle: the REAL 15-minute
+  // active-time tracker for leaderboard topic-completion points.
+  const currentTrackedKey = topicTimeTarget ? (topicTimeTarget.subjectId + '|' + topicTimeTarget.topic) : null;
+  if (topicKey){
+    if (topicKey !== currentTrackedKey){ startTopicTimeTracker(UI.subject, UI.topic); }
+  } else if (currentTrackedKey){
+    stopTopicTimeTrackerCompletely();
+  }
 }
 
 function openProfileModal(){
@@ -3328,6 +3577,17 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('hamburgerBtn').addEventListener('click', ()=>document.getElementById('sidebar').classList.toggle('open'));
   document.getElementById('notifBtnMobile').addEventListener('click', openNotifications);
   document.getElementById('voiceFab').addEventListener('click', voiceFabClicked);
+  // Real topic-time tracker: pause the instant the tab is hidden or the
+  // window loses focus, resume only if a topic is still meant to be
+  // tracked and the page is genuinely active again. Registered once,
+  // globally — never duplicated by any per-view render.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resumeTopicTimeTrackerIfApplicable();
+    else pauseTopicTimeTracker();
+  });
+  window.addEventListener('blur', pauseTopicTimeTracker);
+  window.addEventListener('focus', resumeTopicTimeTrackerIfApplicable);
+  window.addEventListener('beforeunload', () => { if (topicTimeTarget) saveState(); });
   setAuthTab('login');
   renderAll();
   runSplashSequence();
